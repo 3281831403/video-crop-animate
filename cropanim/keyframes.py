@@ -21,6 +21,18 @@ class CropError(Exception):
     """裁切参数、关键帧或批量任务非法时抛出的异常。"""
 
 
+def _median(values):
+    """中位数（标准库未给 statistics 授权时的本地实现）。"""
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+_EASINGS = ("linear", "in", "out", "inout")
+
+
 def ease(name, t):
     """返回缓动曲线在归一化时间 ``t`` 处的进度。
 
@@ -38,7 +50,26 @@ def ease(name, t):
         [0.0, 1.0] 内的 float。t <= 0 返回 0.0，t >= 1 返回 1.0，
         四种曲线都不得在端点跳变。归一化数值比较容差 1e-9。
     """
-    raise NotImplementedError
+    if name not in _EASINGS:
+        raise ValueError("unknown easing: %r" % (name,))
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    if name == "linear":
+        return float(t)
+    if name == "in":
+        return float(t * t)
+    if name == "out":
+        return float(1.0 - (1.0 - t) ** 2)
+    # inout: smoothstep，端点严格落在 0/1 且一阶导数连续
+    return float(t * t * (3.0 - 2.0 * t))
+
+
+def _check_dimensions(rect):
+    """归一化/像素矩形的宽高为负即非法，抛 CropError。"""
+    if rect["w"] < 0 or rect["h"] < 0:
+        raise CropError("rect width/height must be non-negative")
 
 
 def interp_rect(a, b, t, easing="linear"):
@@ -58,7 +89,31 @@ def interp_rect(a, b, t, easing="linear"):
         新的归一化矩形 {"x","y","w","h"}，数值为 float。归一化值
         比较容差 1e-9；换算到像素时按 0.5 像素容差断言。
     """
-    raise NotImplementedError
+    _check_dimensions(a)
+    _check_dimensions(b)
+    if t <= 0.0:
+        return {key: float(a[key]) for key in ("x", "y", "w", "h")}
+    if t >= 1.0:
+        return {key: float(b[key]) for key in ("x", "y", "w", "h")}
+    p = ease(easing, t)
+    return {
+        key: float(a[key] + (b[key] - a[key]) * p)
+        for key in ("x", "y", "w", "h")
+    }
+
+
+def _validate_structure(keyframes):
+    """sample_at / detect_jumps 共用的结构校验。"""
+    if not keyframes:
+        raise CropError("keyframes must not be empty")
+    previous_t = None
+    for frame in keyframes:
+        rect = frame["rect"]
+        _check_dimensions(rect)
+        current_t = frame["t"]
+        if previous_t is not None and current_t <= previous_t:
+            raise CropError("keyframes must be strictly increasing in t")
+        previous_t = current_t
 
 
 def sample_at(keyframes, t):
@@ -76,7 +131,22 @@ def sample_at(keyframes, t):
 
     时间单位 ms；归一化值比较容差 1e-9，像素域比较容差 0.5 像素。
     """
-    raise NotImplementedError
+    _validate_structure(keyframes)
+    times = [frame["t"] for frame in keyframes]
+    if t <= times[0]:
+        # 端点外夹取首帧，不外推
+        return {key: float(keyframes[0]["rect"][key])
+                for key in ("x", "y", "w", "h")}
+    if t >= times[-1]:
+        # 端点外夹取末帧，不外推
+        return {key: float(keyframes[-1]["rect"][key])
+                for key in ("x", "y", "w", "h")}
+    index = bisect.bisect_right(times, t)
+    left = keyframes[index - 1]
+    right = keyframes[index]
+    span = right["t"] - left["t"]
+    fraction = (t - left["t"]) / span if span > 0 else 0.0
+    return interp_rect(left["rect"], right["rect"], fraction, easing="linear")
 
 
 def to_pixels(norm_rect, w, h):
@@ -99,7 +169,15 @@ def to_pixels(norm_rect, w, h):
     异常:
         参数非法抛 CropError。返回 int 字典，不修改输入。
     """
-    raise NotImplementedError
+    _check_dimensions(norm_rect)
+    if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+        raise CropError("frame width/height must be positive integers")
+    return {
+        "x": math.floor(norm_rect["x"] * w),
+        "y": math.floor(norm_rect["y"] * h),
+        "w": math.floor(norm_rect["w"] * w),
+        "h": math.floor(norm_rect["h"] * h),
+    }
 
 
 def clamp_rect(rect, w, h):
@@ -115,7 +193,21 @@ def clamp_rect(rect, w, h):
     输入宽高为负抛 CropError。返回 int 像素矩形；不修改输入。
     像素坐标比较容差 0.5 像素。
     """
-    raise NotImplementedError
+    _check_dimensions(rect)
+    if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+        raise CropError("frame width/height must be positive integers")
+    target_w = max(1, math.floor(rect["w"]))
+    target_h = max(1, math.floor(rect["h"]))
+    if target_w > w or target_h > h:
+        raise CropError("rect is larger than the frame")
+    x = min(max(rect["x"], 0), w - target_w)
+    y = min(max(rect["y"], 0), h - target_h)
+    return {
+        "x": int(x),
+        "y": int(y),
+        "w": int(target_w),
+        "h": int(target_h),
+    }
 
 
 def detect_jumps(keyframes, max_speed):
@@ -135,7 +227,28 @@ def detect_jumps(keyframes, max_speed):
 
     返回升序 list[int]；速度比较相对容差 1e-9，像素域容差 0.5 像素。
     """
-    raise NotImplementedError
+    if max_speed <= 0:
+        raise CropError("max_speed must be positive")
+    _validate_structure(keyframes)
+    if len(keyframes) < 3:
+        return []
+    speeds = []
+    for i in range(1, len(keyframes)):
+        previous = keyframes[i - 1]["rect"]
+        current = keyframes[i]["rect"]
+        center_prev = (previous["x"] + previous["w"] / 2.0,
+                       previous["y"] + previous["h"] / 2.0)
+        center_cur = (current["x"] + current["w"] / 2.0,
+                      current["y"] + current["h"] / 2.0)
+        dx = center_cur[0] - center_prev[0]
+        dy = center_cur[1] - center_prev[1]
+        dt_seconds = (keyframes[i]["t"] - keyframes[i - 1]["t"]) / 1000.0
+        speeds.append(math.hypot(dx, dy) / dt_seconds)
+    base = _median(speeds)
+    if base <= 0:
+        return []
+    threshold = max_speed * base
+    return [i for i, speed in enumerate(speeds, start=1) if speed > threshold]
 
 
 def validate(keyframes, duration):
@@ -153,7 +266,29 @@ def validate(keyframes, duration):
     本函数只返回问题，不抛 CropError；调用方（如 crop_batch）负责抛出。
     时间单位 ms；数值比较容差 1e-9。
     """
-    raise NotImplementedError
+    if duration <= 0:
+        return ["duration: must be positive"]
+    if not keyframes:
+        return ["keyframes: empty"]
+    issues = []
+    previous_t = None
+    for index, frame in enumerate(keyframes):
+        current_t = frame["t"]
+        if current_t < 0 or current_t > duration:
+            issues.append("time: frame %d t=%s outside [0, %s]"
+                          % (index, current_t, duration))
+        if previous_t is not None and current_t <= previous_t:
+            issues.append("order: frame %d t=%s not greater than previous %s"
+                          % (index, current_t, previous_t))
+        previous_t = current_t
+        rect = frame["rect"]
+        if rect["w"] < 0:
+            issues.append("width: frame %d has negative w=%s"
+                          % (index, rect["w"]))
+        if rect["h"] < 0:
+            issues.append("height: frame %d has negative h=%s"
+                          % (index, rect["h"]))
+    return issues
 
 
 def crop_batch(clips, config):
@@ -179,4 +314,30 @@ def crop_batch(clips, config):
 
     像素坐标比较容差 0.5 像素；时间单位 ms。
     """
-    raise NotImplementedError
+    width = config["width"]
+    height = config["height"]
+    times = config["times"]
+    if (not isinstance(width, int) or not isinstance(height, int)
+            or width <= 0 or height <= 0):
+        raise CropError("config width/height must be positive integers")
+
+    seen_ids = set()
+    for clip in clips:
+        if clip["id"] in seen_ids:
+            raise CropError("duplicate clip id: %r" % (clip["id"],))
+        seen_ids.add(clip["id"])
+        # 原子性：先校验全部片，任一非法即整体失败
+        if validate(clip["keyframes"], clip["duration"]):
+            raise CropError("invalid clip: %r" % (clip["id"],))
+
+    result = {}
+    for clip in clips:
+        # 每片只用自己的 keyframes，片之间互不串用
+        frames = clip["keyframes"]
+        rects = []
+        for t in times:
+            norm = sample_at(frames, t)
+            pixels = to_pixels(norm, width, height)
+            rects.append(clamp_rect(pixels, width, height))
+        result[clip["id"]] = rects
+    return result
